@@ -1,7 +1,7 @@
 local kAddonRoot = "clientside_triggers/"
 
 local kSharedFiles = {
-  "sh_trigger_multiple_fix.lua"
+  "sh_trigger_multiple_fix.lua",
   "sh_trigger_teleport_fix.lua"
 }
 
