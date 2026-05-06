@@ -206,6 +206,8 @@ local function decode_teleport_snapshot(raw_snapshot_data)
       decoded_triggers[#decoded_triggers + 1] = {
         id = tostring(raw_entry.id),
         ent_index = tonumber(raw_entry.ent_index) or tonumber(raw_entry.id) or 0,
+        destination_ent_index = tonumber(raw_entry.destination_ent_index) or 0,
+        landmark_ent_index = tonumber(raw_entry.landmark_ent_index) or 0,
         world_mins = array_to_vector(raw_entry.world_mins),
         world_maxs = array_to_vector(raw_entry.world_maxs),
         spawnflags = tonumber(raw_entry.spawnflags) or 0,
@@ -233,6 +235,8 @@ if SERVER then
   local active_triggers_ = {}
   local state_by_player_ = {}
   local captured_keyvalues_by_entity_ = setmetatable({}, {__mode = "k"})
+  local output_events_by_entity_ = setmetatable({}, {__mode = "k"})
+  local output_keyvalues_backfilled_by_entity_ = setmetatable({}, {__mode = "k"})
   local logical_disabled_by_entity_ = setmetatable({}, {__mode = "k"})
   local native_disabled_by_entity_ = setmetatable({}, {__mode = "k"})
   local native_disable_input_by_entity_ = setmetatable({}, {__mode = "k"})
@@ -307,6 +311,150 @@ if SERVER then
     native_disabled_by_entity_[trigger_entity] = true
   end
 
+  local function get_output_event_kind(output_key)
+    if not isstring(output_key) then
+      return nil
+    end
+
+    local output_key_lower = string.lower(output_key)
+    if string.sub(output_key_lower, 1, 9) == "ontrigger" then
+      return "trigger"
+    end
+
+    if string.sub(output_key_lower, 1, 12) == "onstarttouch" then
+      return "start_touch"
+    end
+
+    if string.sub(output_key_lower, 1, 10) == "onendtouch" then
+      return "end_touch"
+    end
+
+    return nil
+  end
+
+  local function parse_output_event(output_value)
+    if not isstring(output_value) then
+      return nil
+    end
+
+    local output_parts = string.Explode(",", output_value, false)
+    if #output_parts < 2 then
+      return nil
+    end
+
+    local target_name = string.Trim(output_parts[1] or "")
+    local input_name = string.Trim(output_parts[2] or "")
+    if target_name == "" or input_name == "" then
+      return nil
+    end
+
+    local fire_count = tonumber(string.Trim(output_parts[5] or "-1")) or -1
+    return {
+      target_name = target_name,
+      input_name = input_name,
+      parameter = string.Trim(output_parts[3] or ""),
+      delay = tonumber(string.Trim(output_parts[4] or "0")) or 0,
+      remaining = fire_count
+    }
+  end
+
+  local function append_output_event(entity_value, event_kind, output_event)
+    local output_table = output_events_by_entity_[entity_value]
+    if not output_table then
+      output_table = {}
+      output_events_by_entity_[entity_value] = output_table
+    end
+
+    local output_list = output_table[event_kind]
+    if not output_list then
+      output_list = {}
+      output_table[event_kind] = output_list
+    end
+
+    output_list[#output_list + 1] = output_event
+  end
+
+  local function fire_output_event(output_event, activator, caller)
+    if output_event.remaining == 0 then
+      return
+    end
+
+    local target_name_lower = string.lower(output_event.target_name)
+    local target_entities = {}
+
+    if target_name_lower == "!activator" then
+      if IsValid(activator) then
+        target_entities[1] = activator
+      end
+    elseif target_name_lower == "!caller" then
+      if IsValid(caller) then
+        target_entities[1] = caller
+      end
+    else
+      target_entities = ents.FindByName(output_event.target_name)
+    end
+
+    for target_index = 1, #target_entities do
+      local target_entity = target_entities[target_index]
+      if IsValid(target_entity) then
+        target_entity:Fire(
+            output_event.input_name,
+            output_event.parameter,
+            output_event.delay,
+            activator,
+            caller)
+      end
+    end
+
+    if output_event.remaining > 0 then
+      output_event.remaining = output_event.remaining - 1
+    end
+  end
+
+  local function fire_entity_outputs(entity_value, event_kind, activator, caller)
+    if not IsValid(entity_value) then
+      return
+    end
+
+    local output_table = output_events_by_entity_[entity_value]
+    if not output_table then
+      return
+    end
+
+    local output_list = output_table[event_kind]
+    if not istable(output_list) then
+      return
+    end
+
+    for output_index = 1, #output_list do
+      fire_output_event(output_list[output_index], activator, caller)
+    end
+  end
+
+  local function backfill_outputs_from_keyvalues(entity_value)
+    if not IsValid(entity_value) or
+        output_keyvalues_backfilled_by_entity_[entity_value] == true then
+      return
+    end
+
+    output_keyvalues_backfilled_by_entity_[entity_value] = true
+
+    local key_values = entity_value:GetKeyValues()
+    if not istable(key_values) then
+      return
+    end
+
+    for key_name, key_value in pairs(key_values) do
+      local event_kind = get_output_event_kind(key_name)
+      if event_kind then
+        local output_event = parse_output_event(key_value)
+        if output_event then
+          append_output_event(entity_value, event_kind, output_event)
+        end
+      end
+    end
+  end
+
   local function build_teleport_snapshot()
     local teleport_snapshot = {}
     local teleport_entities = ents.FindByClass("trigger_teleport")
@@ -326,6 +474,9 @@ if SERVER then
 
         if IsValid(destination_entity) and landmark_is_valid and world_mins and
             world_maxs then
+          backfill_outputs_from_keyvalues(trigger_entity)
+          backfill_outputs_from_keyvalues(destination_entity)
+
           local logical_disabled = logical_disabled_by_entity_[trigger_entity]
           if logical_disabled == nil then
             logical_disabled = get_initial_disabled(trigger_entity, key_values)
@@ -343,6 +494,7 @@ if SERVER then
           local snapshot_entry = {
             id = trigger_entity:EntIndex(),
             ent_index = trigger_entity:EntIndex(),
+            destination_ent_index = destination_entity:EntIndex(),
             world_mins = vector_to_array(world_mins),
             world_maxs = vector_to_array(world_maxs),
             spawnflags = spawnflags,
@@ -355,6 +507,7 @@ if SERVER then
           }
 
           if has_landmark and IsValid(landmark_entity) then
+            snapshot_entry.landmark_ent_index = landmark_entity:EntIndex()
             snapshot_entry.landmark_pos = vector_to_array(landmark_entity:GetPos())
             snapshot_entry.landmark_angle =
                 angle_to_array(sanitize_view_angles(landmark_entity:GetAngles()))
@@ -431,9 +584,9 @@ if SERVER then
   local function apply_server_teleport(ply, mv, cmd, trigger_data, current_pos)
     local destination_pos, destination_angle =
         calculate_teleport_destination(trigger_data, current_pos)
+    local trigger_entity = Entity(trigger_data.ent_index)
+    local destination_entity = Entity(trigger_data.destination_ent_index)
 
-    -- TODO: capture OnStartTouch/OnEndTouch outputs if map compatibility needs it.
-    -- TODO: manually fire copied outputs or call TriggerOutput on a wrapper entity if needed.
     ply:SetPos(destination_pos)
     mv:SetOrigin(destination_pos)
 
@@ -448,6 +601,15 @@ if SERVER then
       end
     end
 
+    fire_entity_outputs(trigger_entity, "start_touch", ply, trigger_entity)
+    fire_entity_outputs(trigger_entity, "trigger", ply, trigger_entity)
+    fire_entity_outputs(
+        destination_entity,
+        "trigger",
+        ply,
+        destination_entity)
+    fire_entity_outputs(trigger_entity, "end_touch", ply, trigger_entity)
+
     debug_print(
         "server teleport",
         ply:Nick(),
@@ -460,11 +622,31 @@ if SERVER then
 
   hook.Add("EntityKeyValue", "sm_trigger_teleport_replace_CaptureKeyValues",
            function(entity_value, key_name, key_value)
-    if not IsValid(entity_value) or entity_value:GetClass() ~= "trigger_teleport" then
+    if not IsValid(entity_value) then
+      return
+    end
+
+    local class_name = entity_value:GetClass()
+    if class_name ~= "trigger_teleport" and
+        class_name ~= "info_teleport_destination" then
       return
     end
 
     local lower_key_name = string.lower(key_name or "")
+    local output_event_kind = get_output_event_kind(key_name)
+    if output_event_kind then
+      local output_event = parse_output_event(key_value)
+      if output_event then
+        append_output_event(entity_value, output_event_kind, output_event)
+      end
+
+      return
+    end
+
+    if class_name ~= "trigger_teleport" then
+      return
+    end
+
     if lower_key_name ~= "target" and lower_key_name ~= "landmark" and
         lower_key_name ~= "startdisabled" and lower_key_name ~= "spawnflags" then
       return
